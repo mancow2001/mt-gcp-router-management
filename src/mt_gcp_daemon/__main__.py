@@ -6,7 +6,19 @@ from .daemon import startup, run_loop
 def main():
 
     cfg = Config()
-    logger = setup_logger(cfg.logger_name, cfg.log_level, cfg.log_file, cfg.log_max_bytes, cfg.log_backup_count)
+    
+    # Enhanced logger setup with structured logging support
+    logger = setup_logger(
+        name=cfg.logger_name,
+        level=cfg.log_level,
+        log_file=cfg.log_file,
+        max_bytes=cfg.log_max_bytes,
+        backup_count=cfg.log_backup_count,
+        # Add the new structured logging parameters
+        enable_structured_console=cfg.enable_structured_console,
+        enable_structured_file=cfg.enable_structured_file,
+        structured_log_file=cfg.structured_log_file
+    )
 
     if cfg.enable_gcp_logging:
         try:
