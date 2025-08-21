@@ -28,15 +28,15 @@ The MT GCP Health Check Daemon automatically monitors the health of GCP backend 
          │                       │                       │
          └───────────────────────┼───────────────────────┘
                                  │
-                    ┌─────────────────┐
-                    │  Health Check   │
-                    │     Daemon      │
-                    │                 │
-                    │ • State Machine │
-                    │ • Route Manager │
+                    ┌────────────────────┐
+                    │  Health Check      │
+                    │     Daemon         │
+                    │                    │
+                    │ • State Machine    │
+                    │ • Route Manager    │
                     │ • Circuit Breakers │
-                    │ • Structured Logs │
-                    └─────────────────┘
+                    │ • Structured Logs  │
+                    └────────────────────┘
 ```
 
 ## State-Based Routing Logic
