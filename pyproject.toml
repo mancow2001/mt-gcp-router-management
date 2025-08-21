@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=66", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mt-gcp-daemon"
+version = "0.1.0"
+description = "Multi-region GCP backend/BGP health daemon with Cloudflare Magic Transit route control"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Your Name"}]
+dependencies = [
+    "google-api-python-client>=2.140.0",
+    "google-auth>=2.30.0",
+    "google-cloud-logging>=3.11.2",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32.3",
+]
+
+[project.scripts]
+mt-gcp-daemon = "mt_gcp_daemon.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["mt_gcp_daemon"]
