@@ -56,7 +56,7 @@ The daemon uses a state machine to determine routing actions based on health com
 
 ### Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - GCP Service Account with appropriate permissions
 - Cloudflare API token with Magic Transit access
 - Network access to GCP and Cloudflare APIs
