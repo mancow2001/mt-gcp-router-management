@@ -1,4 +1,4 @@
-# project_docs_extract — MT GCP DAEMON
+# MT GCP DAEMON
 
 ## Overview
 
@@ -17,15 +17,9 @@ It uses:
 ## Directory Structure
 
 ```text
-project_docs_extract/
-    __MACOSX/
-        mt-gcp-daemon-modularized/
-            src/
-                mt_gcp_daemon/
-                mt_gcp_daemon.egg-info/
-            systemd/
     mt-gcp-daemon-modularized/
         README.md
+        .env
         key.json
         pyproject.toml
         requirements.txt
@@ -40,14 +34,7 @@ project_docs_extract/
                 gcp.py
                 logging_setup.py
                 state.py
-            mt_gcp_daemon.egg-info/
-                PKG-INFO
-                SOURCES.txt
-                dependency_links.txt
-                entry_points.txt
-                requires.txt
-                top_level.txt
-
+            
 ```
 ## Configuration (.env)
 
@@ -70,6 +57,7 @@ Set these environment variables (or put them in a `.env` file):
 - `LOCAL_BGP_ROUTER`
 - `LOCAL_GCP_REGION`
 - `LOG_BACKUP_COUNT`
+- `LOGGER_NAME`
 - `LOG_FILE`
 - `LOG_LEVEL`
 - `LOG_MAX_BYTES`
@@ -155,7 +143,7 @@ _None found._
 
 ### `mt-gcp-daemon-modularized/src/mt_gcp_daemon/config.py`
 **Imports:** external: dataclasses, dotenv, ipaddress, os
-**Env Vars used:** BGP_PEER_PROJECT, CHECK_INTERVAL_SECONDS, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_TIMEOUT_SECONDS, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, CLOUDFLARE_PRIMARY_PRIORITY, CLOUDFLARE_SECONDARY_PRIORITY, DESCRIPTION_SUBSTRING, ENABLE_GCP_LOGGING, GCP_PROJECT, GOOGLE_APPLICATION_CREDENTIALS, INITIAL_BACKOFF_SECONDS, LOCAL_BGP_REGION, LOCAL_BGP_ROUTER, LOCAL_GCP_REGION, LOG_BACKUP_COUNT, LOG_FILE, LOG_LEVEL, LOG_MAX_BYTES, MAX_BACKOFF_SECONDS, MAX_RETRIES, PRIMARY_INTERNAL_IP, PRIMARY_PREFIX, REMOTE_BGP_REGION, REMOTE_BGP_ROUTER, REMOTE_GCP_REGION, SECONDARY_INTERNAL_IP, SECONDARY_PREFIX
+**Env Vars used:** BGP_PEER_PROJECT, CHECK_INTERVAL_SECONDS, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_TIMEOUT_SECONDS, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, CLOUDFLARE_PRIMARY_PRIORITY, CLOUDFLARE_SECONDARY_PRIORITY, DESCRIPTION_SUBSTRING, ENABLE_GCP_LOGGING, GCP_PROJECT, GOOGLE_APPLICATION_CREDENTIALS, INITIAL_BACKOFF_SECONDS, LOCAL_BGP_REGION, LOCAL_BGP_ROUTER, LOCAL_GCP_REGION, LOG_BACKUP_COUNT, LOG_FILE, LOGGER_NAME, LOG_LEVEL, LOG_MAX_BYTES, MAX_BACKOFF_SECONDS, MAX_RETRIES, PRIMARY_INTERNAL_IP, PRIMARY_PREFIX, REMOTE_BGP_REGION, REMOTE_BGP_ROUTER, REMOTE_GCP_REGION, SECONDARY_INTERNAL_IP, SECONDARY_PREFIX
 
 **Functions**
 - `validate_configuration(cfg)`
