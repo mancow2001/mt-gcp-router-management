@@ -22,6 +22,9 @@ class Config:
             - log_max_bytes: Log file size before rotation.
             - log_backup_count: Number of rotated backups to retain.
             - enable_gcp_logging: Enable/disable Stackdriver logging.
+            - enable_structured_console: Output JSON to console for structured events.
+            - enable_structured_file: Output JSON to separate structured log file.
+            - structured_log_file: Path to structured JSON log file.
 
         GCP & Regions:
             - gcp_project: GCP project ID.
@@ -54,6 +57,11 @@ class Config:
     log_max_bytes: int = int(os.getenv('LOG_MAX_BYTES', 10 * 1024 * 1024))
     log_backup_count: int = int(os.getenv('LOG_BACKUP_COUNT', 5))
     enable_gcp_logging: bool = os.getenv('ENABLE_GCP_LOGGING', 'false').lower() == 'true'
+    
+    # NEW: Structured logging options
+    enable_structured_console: bool = os.getenv('ENABLE_STRUCTURED_CONSOLE', 'false').lower() == 'true'
+    enable_structured_file: bool = os.getenv('ENABLE_STRUCTURED_FILE', 'true').lower() == 'true'  # Default to true
+    structured_log_file: str | None = os.getenv('STRUCTURED_LOG_FILE', '/var/log/radius_healthcheck_daemon_structured.json')
 
     # GCP and routing regions
     gcp_project: str | None = os.getenv('GCP_PROJECT')
@@ -168,5 +176,15 @@ def validate_configuration(cfg: Config) -> list[str]:
         errors.append(f"GCP credentials file not found: {creds}")
     elif creds and not os.access(creds, os.R_OK):
         errors.append(f"GCP credentials file not readable: {creds}")
+
+    # Validate structured log file path if enabled
+    if cfg.enable_structured_file and cfg.structured_log_file:
+        structured_log_dir = os.path.dirname(cfg.structured_log_file)
+        if structured_log_dir and not os.path.exists(structured_log_dir):
+            # Try to create the directory
+            try:
+                os.makedirs(structured_log_dir, exist_ok=True)
+            except Exception as e:
+                errors.append(f"Cannot create structured log directory {structured_log_dir}: {e}")
 
     return errors
