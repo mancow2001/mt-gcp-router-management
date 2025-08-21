@@ -342,21 +342,8 @@ mt-gcp-daemon/
 │   ├── gcp.py                   # GCP API integration
 │   └── cloudflare.py           # Cloudflare API integration
 ├── requirements.txt
-├── setup.py
+├── installer.sh
 └── README.md
-```
-
-### Running Tests
-
-```bash
-# Unit tests
-python -m pytest tests/
-
-# Integration tests (requires valid credentials)
-python -m pytest tests/integration/
-
-# Configuration validation
-python -m mt_gcp_daemon.config --validate
 ```
 
 ### Code Quality
@@ -443,7 +430,8 @@ Configure log rotation in `/etc/logrotate.d/mt-gcp-daemon`:
 
 ## License
 
-[Your License Here]
+Created by Caffeineoverflow
+Nathan Bray
 
 ## Support
 
@@ -455,6 +443,6 @@ For issues and questions:
 
 ---
 
-**Version**: 1.0.0  
-**Last Updated**: August 2024  
-**Python**: 3.9+ required
+**Version**: 1.1.0  
+**Last Updated**: August 2025  
+**Python**: 3.10+ required
