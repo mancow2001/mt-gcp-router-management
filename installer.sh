@@ -22,14 +22,14 @@ fi
 # ---- Helpers ----------------------------------------------------------------
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Accept 3.9+ (but prefer ≥3.10). We'll warn later if 3.9 is used.
+# Require Python 3.10+ (no longer accept 3.9)
 py_ok() {
   local bin="$1"
   if ! need_cmd "$bin"; then return 1; fi
   local ver major minor
   ver="$("$bin" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" || return 1
   major="${ver%%.*}"; minor="${ver##*.}"
-  [[ "$major" == "3" && "$minor" -ge 9 ]]
+  [[ "$major" == "3" && "$minor" -ge 10 ]]
 }
 
 detect_like_rhel() {
@@ -48,9 +48,9 @@ require_root() {
   fi
 }
 
-# ---- Updated: prefer direct versioned RPMs (3.12/3.11/3.10/3.9), then modules, then generic ----
+# ---- Updated: prefer direct versioned RPMs (3.12/3.11/3.10), then modules, then generic ----
 install_python_rpm() {
-  local candidates=("3.12" "3.11" "3.10" "3.9")
+  local candidates=("3.12" "3.11" "3.10")
 
   if need_cmd dnf; then
     echo "[*] Detected dnf-based system."
@@ -86,40 +86,82 @@ install_python_rpm() {
       done
     fi
 
-    # 3) Fallback: generic python3
-    echo "[!] Versioned Python not found via RPMs/modules; installing generic python3."
-    dnf -y install python3 python3-devel rsync || true
-    return 0
+    # 3) Fallback: generic python3 (only if it's 3.10+)
+    echo "[!] Versioned Python not found via RPMs/modules; trying generic python3."
+    if dnf -y install python3 python3-devel rsync >/dev/null 2>&1; then
+      if py_ok python3; then
+        echo "[+] Generic python3 is suitable (3.10+)."
+        return 0
+      else
+        echo "[-] Generic python3 is too old (< 3.10). Removing..."
+        dnf -y remove python3 python3-devel >/dev/null 2>&1 || true
+        return 1
+      fi
+    fi
+    return 1
 
   elif need_cmd yum; then
     echo "[*] Detected yum-based system."
-    yum -y install python3 python3-devel rsync || true
-    return 0
+    if yum -y install python3 python3-devel rsync; then
+      if py_ok python3; then
+        echo "[+] Installed suitable Python via yum."
+        return 0
+      else
+        echo "[-] Installed python3 is too old (< 3.10). Removing..."
+        yum -y remove python3 python3-devel >/dev/null 2>&1 || true
+        return 1
+      fi
+    fi
+    return 1
   fi
 
   return 1
 }
 
 install_python() {
-  echo "[-] Suitable Python (3.9+) not found. Installing best available..."
+  echo "[-] Suitable Python (3.10+) not found. Installing best available..."
   if need_cmd apt; then
     export DEBIAN_FRONTEND=noninteractive
     apt update -y
-    apt install -y python3 python3-venv python3-dev rsync
+    
+    # Try to install specific versions first
+    local installed=false
+    for version in python3.12 python3.11 python3.10; do
+      if apt install -y "${version}" "${version}-venv" "${version}-dev" rsync 2>/dev/null; then
+        echo "[+] Installed ${version} via apt."
+        installed=true
+        break
+      fi
+    done
+    
+    if [[ "$installed" == "false" ]]; then
+      # Fallback to generic python3
+      if apt install -y python3 python3-venv python3-dev rsync; then
+        if py_ok python3; then
+          echo "[+] Generic python3 is suitable (3.10+)."
+        else
+          echo "[-] Generic python3 is too old (< 3.10)."
+          return 1
+        fi
+      else
+        return 1
+      fi
+    fi
+    
   elif detect_like_rhel || need_cmd dnf || need_cmd yum; then
     install_python_rpm || {
-      echo "[-] Could not install Python via RPM paths."
+      echo "[-] Could not install suitable Python (3.10+) via RPM paths."
       return 1
     }
   else
-    echo "[-] Unsupported distro (no apt/dnf/yum). Install Python ≥3.9 manually and re-run."
+    echo "[-] Unsupported distro (no apt/dnf/yum). Install Python ≥3.10 manually and re-run."
     return 1
   fi
 }
 
-# Prefer highest version; includes 3.9 as last resort.
+# Prefer highest version; removed 3.9 support
 pick_python_bin() {
-  local bins=(python3.12 python3.11 python3.10 python3.9 python3)
+  local bins=(python3.12 python3.11 python3.10 python3)
   for b in "${bins[@]}"; do
     if py_ok "$b"; then
       echo "$b"; return 0
@@ -132,23 +174,16 @@ pick_python_bin() {
 require_root
 
 # Ensure Python present / install if needed
-if ! py_ok python3 && ! py_ok python3.12 && ! py_ok python3.11 && ! py_ok python3.10 && ! py_ok python3.9; then
-  install_python || { echo "[-] Failed to install any Python. Aborting."; exit 1; }
+if ! py_ok python3 && ! py_ok python3.12 && ! py_ok python3.11 && ! py_ok python3.10; then
+  install_python || { echo "[-] Failed to install Python 3.10+. Aborting."; exit 1; }
 fi
 
 PY_BIN="$(pick_python_bin || true)"
 if [[ -z "${PY_BIN}" ]]; then
-  echo "[-] Python 3.9+ not available after install."
+  echo "[-] Python 3.10+ not available after install."
   exit 1
 fi
 echo "[+] Using Python: ${PY_BIN} ($("${PY_BIN}" -V 2>&1))"
-
-# Warn if 3.9 (allowed but not preferred)
-PY_MINOR="$("${PY_BIN}" -c 'import sys; print(sys.version_info.minor)')"
-if [[ "${PY_MINOR}" -eq 9 ]]; then
-  echo "⚠️  WARNING: Using Python 3.9. This is allowed but **not preferred**."
-  echo "   Consider upgrading to Python 3.10+ for better performance and longer support."
-fi
 
 echo "[*] Creating install dir: ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
