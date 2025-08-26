@@ -431,10 +431,6 @@ sudo ./installer.sh --uninstall
 - **Last Updated**: August 2025
 - **Author**: Caffeineoverflow (Nathan Bray)
 
-## License
-
-MIT License
-
 ## Support
 
 For issues and questions:

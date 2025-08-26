@@ -85,7 +85,7 @@ Production Considerations:
     - Consider impact of check_interval on response time vs resource usage
     - Ensure GCP and Cloudflare credentials have minimal required permissions
 
-Author: MT GCP Daemon Team
+Author: Nathan Bray
 Version: 1.1 (Local Router Only)
 Last Modified: 2025
 Dependencies: gcp, cloudflare, circuit, state, structured_events modules

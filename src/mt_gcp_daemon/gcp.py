@@ -102,9 +102,9 @@ Monitoring and Alerting:
     - Monitor API error rates and quota usage
     - Set up dashboards for service health trends and BGP advertisement status
 
-Author: MT GCP Daemon Team
+Author: Nathan Bray
 Version: 1.0
-Last Modified: 2024
+Last Modified: 2025
 Dependencies: google-cloud-compute, google-auth, googleapiclient
 """
 

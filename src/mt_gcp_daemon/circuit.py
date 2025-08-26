@@ -41,7 +41,7 @@ Integration with Structured Logging:
     - Performance metrics and timing
     - Service recovery events
 
-Author: MT GCP Daemon Team
+Author: Nathan Bray
 Version: 1.1
 Last Modified: 2025
 """
