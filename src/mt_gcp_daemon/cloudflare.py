@@ -67,7 +67,7 @@ Security Considerations:
     - Monitor API usage for unauthorized access
     - Implement proper error handling to avoid token exposure in logs
 
-Author: MT GCP Daemon Team
+Author: Nathan Bray
 Version: 1.1
 Last Modified: 2025
 Dependencies: requests, structured_events module
