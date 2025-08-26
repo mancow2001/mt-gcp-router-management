@@ -104,6 +104,11 @@ API token requires:
    pip install -e .
    ```
 
+4. **Run the automated installer (Linux):**
+   ```bash
+   sudo ./installer.sh
+   ```
+
 ## Configuration
 
 ### Environment Variables
@@ -115,9 +120,11 @@ Create a `.env` file with the following configuration:
 LOGGER_NAME=CENTRAL_RAD_HC
 LOG_LEVEL=INFO
 LOG_FILE=/var/log/radius_healthcheck_daemon.log
-ENABLE_GCP_LOGGING=true
+LOG_MAX_BYTES=10485760
+LOG_BACKUP_COUNT=5
+ENABLE_GCP_LOGGING=false
 
-# Structured Logging (NEW)
+# Structured Logging
 ENABLE_STRUCTURED_CONSOLE=false
 ENABLE_STRUCTURED_FILE=true
 STRUCTURED_LOG_FILE=/var/log/radius_healthcheck_daemon_structured.json
@@ -129,15 +136,15 @@ LOCAL_GCP_REGION=us-central1
 REMOTE_GCP_REGION=us-east4
 
 # BGP Configuration
-LOCAL_BGP_ROUTER=primary-router
-REMOTE_BGP_ROUTER=secondary-router
-LOCAL_BGP_REGION=us-central1
-REMOTE_BGP_REGION=us-east4
 BGP_PEER_PROJECT=your-bgp-project-id
+LOCAL_BGP_REGION=us-central1
+LOCAL_BGP_ROUTER=primary-router
+REMOTE_BGP_REGION=us-east4
+REMOTE_BGP_ROUTER=secondary-router
 
 # Network Prefixes
-PRIMARY_PREFIX=10.0.1.0/24
-SECONDARY_PREFIX=10.0.2.0/24
+PRIMARY_PREFIX=10.137.245.0/25
+SECONDARY_PREFIX=10.137.19.0/25
 
 # Cloudflare Configuration
 CLOUDFLARE_ACCOUNT_ID=your-account-id
@@ -149,6 +156,8 @@ CLOUDFLARE_SECONDARY_PRIORITY=200
 # Daemon Settings
 CHECK_INTERVAL_SECONDS=60
 MAX_RETRIES=3
+INITIAL_BACKOFF_SECONDS=1
+MAX_BACKOFF_SECONDS=60
 CIRCUIT_BREAKER_THRESHOLD=5
 CIRCUIT_BREAKER_TIMEOUT_SECONDS=300
 ```
@@ -343,6 +352,7 @@ mt-gcp-daemon/
 │   └── cloudflare.py           # Cloudflare API integration
 ├── requirements.txt
 ├── installer.sh
+├── pyproject.toml
 └── README.md
 ```
 
@@ -360,30 +370,23 @@ The codebase follows Python best practices:
 
 ### Systemd Service
 
-Create `/etc/systemd/system/mt-gcp-daemon.service`:
+The installer script automatically creates a systemd service at `/etc/systemd/system/mt-gcp-daemon.service`:
 
 ```ini
 [Unit]
-Description=MT GCP Health Check Daemon
+Description=MT GCP Healthcheck & Cloudflare Failover Daemon
 After=network.target
-Wants=network.target
 
 [Service]
 Type=simple
-User=daemon-user
-Group=daemon-group
 WorkingDirectory=/opt/mt-gcp-daemon
-ExecStart=/usr/bin/python3 -m mt_gcp_daemon
-Restart=always
-RestartSec=10
+Environment=PYTHONPATH=/opt/mt-gcp-daemon/src:$PYTHONPATH
 EnvironmentFile=/opt/mt-gcp-daemon/.env
-
-# Security settings
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/log
+ExecStart=/opt/mt-gcp-daemon/venv/bin/python -u -m mt_gcp_daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -405,12 +408,13 @@ Configure log rotation in `/etc/logrotate.d/mt-gcp-daemon`:
 }
 ```
 
-### Monitoring Setup
+### Uninstalling
 
-1. **Set up log-based metrics** in GCP Cloud Monitoring
-2. **Configure alerting policies** for critical events
-3. **Create dashboards** for operational visibility
-4. **Set up notification channels** for alert delivery
+To uninstall the daemon:
+
+```bash
+sudo ./installer.sh --uninstall
+```
 
 ## Security Considerations
 
@@ -420,18 +424,16 @@ Configure log rotation in `/etc/logrotate.d/mt-gcp-daemon`:
 - **Monitoring**: Watch for unauthorized API usage
 - **Rotation**: Regularly rotate service account keys
 
-## Contributing
+## Version Information
 
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Update documentation
-5. Submit a pull request
+- **Version**: 1.1.0
+- **Python**: 3.10+ required
+- **Last Updated**: August 2025
+- **Author**: Caffeineoverflow (Nathan Bray)
 
 ## License
 
-Created by Caffeineoverflow
-Nathan Bray
+MIT License
 
 ## Support
 
@@ -443,6 +445,4 @@ For issues and questions:
 
 ---
 
-**Version**: 1.1.0  
-**Last Updated**: August 2025  
-**Python**: 3.10+ required
+**Ready to deploy**: Use the `installer.sh` script for automated installation and systemd service configuration.
