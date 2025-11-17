@@ -73,11 +73,13 @@ class StructuredEventLogger:
             result = event.get("result")
         else:
             result = event.result
-            
+
         if result == ActionResult.FAILURE.value:
             level = logging.ERROR
         elif result == ActionResult.NO_CHANGE.value:
             level = logging.DEBUG
+        elif result == ActionResult.SKIPPED.value:
+            level = logging.INFO  # Skipped operations are informational, not errors
             
         # Format message for human readability while preserving structure
         if isinstance(event, dict):

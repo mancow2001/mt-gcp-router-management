@@ -91,24 +91,25 @@ BULK_UPDATE_TIMEOUT = 60      # seconds for bulk operations
 MAX_ROUTES_PER_REQUEST = 1000 # Cloudflare API limit (approximate)
 
 
-def validate_cloudflare_connectivity(account_id: str, token: str) -> None:
+def validate_cloudflare_connectivity(account_id: str, token: str, timeout: int = DEFAULT_REQUEST_TIMEOUT) -> None:
     """
     Validates Cloudflare API connectivity and permissions for Magic Transit operations.
-    
+
     This function performs a two-step validation process to ensure the provided
     credentials are valid and have the necessary permissions:
-    
+
     1. Token Verification: Validates the API token itself
     2. Route Access Test: Confirms access to Magic Transit routes for the account
-    
+
     This validation should be performed at startup to fail fast if credentials
     are invalid, rather than discovering issues during operational route updates.
-    
+
     Args:
         account_id (str): Cloudflare account ID (typically a UUID-like string).
             Can be found in the Cloudflare dashboard under account settings.
         token (str): Cloudflare API token with Magic Transit permissions.
             Should have Account:Read and Zone:Zone Settings:Edit permissions.
+        timeout (int, optional): Request timeout in seconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
             
     Raises:
         requests.exceptions.HTTPError: If HTTP request fails (4xx/5xx status codes)
@@ -168,7 +169,7 @@ def validate_cloudflare_connectivity(account_id: str, token: str) -> None:
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": "mt-gcp-daemon/1.0"  # Identify our application
+        "User-Agent": "gcp-route-mgmt/1.0"  # Identify our application
     }
 
     logger.debug(f"Validating Cloudflare connectivity for account {account_id}")
@@ -178,7 +179,7 @@ def validate_cloudflare_connectivity(account_id: str, token: str) -> None:
         verify_url = f"{CLOUDFLARE_API_BASE}/accounts/{account_id}/tokens/verify"
         logger.debug(f"Verifying token at: {verify_url}")
         
-        r = requests.get(verify_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        r = requests.get(verify_url, headers=headers, timeout=timeout)
         r.raise_for_status()  # Raises HTTPError for 4xx/5xx responses
         
         # Parse and validate token verification response
@@ -193,7 +194,7 @@ def validate_cloudflare_connectivity(account_id: str, token: str) -> None:
         list_url = f"{CLOUDFLARE_API_BASE}/accounts/{account_id}/magic/routes"
         logger.debug(f"Testing route access at: {list_url}")
         
-        r2 = requests.get(list_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        r2 = requests.get(list_url, headers=headers, timeout=timeout)
         r2.raise_for_status()  # Raises HTTPError for 4xx/5xx responses
         
         # Parse and validate routes list response
@@ -234,7 +235,9 @@ def update_routes_by_description_bulk(account_id: str,
                                     token: str,
                                     desc_substring: str,
                                     desired_priority: int,
-                                    structured_logger: Optional[StructuredEventLogger] = None) -> bool:
+                                    structured_logger: Optional[StructuredEventLogger] = None,
+                                    timeout: int = DEFAULT_REQUEST_TIMEOUT,
+                                    bulk_timeout: int = BULK_UPDATE_TIMEOUT) -> bool:
     """
     Bulk update Magic Transit route priorities for routes matching a description pattern.
     
@@ -270,6 +273,10 @@ def update_routes_by_description_bulk(account_id: str,
             Typically 1-1000, where lower numbers indicate higher priority.
         structured_logger (StructuredEventLogger, optional): Logger for structured
             events. If provided, detailed operation metrics and results will be logged.
+        timeout (int, optional): Request timeout in seconds for route fetching.
+            Defaults to DEFAULT_REQUEST_TIMEOUT.
+        bulk_timeout (int, optional): Request timeout in seconds for bulk update operations.
+            Defaults to BULK_UPDATE_TIMEOUT.
             
     Returns:
         bool: True if operation completed successfully (including no-change scenarios),
@@ -381,7 +388,7 @@ def update_routes_by_description_bulk(account_id: str,
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": "mt-gcp-daemon/1.0"
+        "User-Agent": "gcp-route-mgmt/1.0"
     }
 
     logger.debug(f"Starting bulk route update: account={account_id}, "
@@ -392,7 +399,7 @@ def update_routes_by_description_bulk(account_id: str,
         list_url = f"{CLOUDFLARE_API_BASE}/accounts/{account_id}/magic/routes"
         logger.debug(f"Fetching routes from: {list_url}")
         
-        r = requests.get(list_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+        r = requests.get(list_url, headers=headers, timeout=timeout)
         operation_details["api_calls_made"] += 1
         r.raise_for_status()
         
@@ -477,7 +484,7 @@ def update_routes_by_description_bulk(account_id: str,
             
             logger.debug(f"Sending bulk update request with {len(updates)} route changes")
             put_resp = requests.put(list_url, headers=headers, json=payload,
-                                  timeout=BULK_UPDATE_TIMEOUT)
+                                  timeout=bulk_timeout)
             operation_details["api_calls_made"] += 1
             put_resp.raise_for_status()
             
@@ -560,17 +567,19 @@ def update_routes_by_description_bulk(account_id: str,
 
 def get_routes_by_description(account_id: str,
                             token: str,
-                            desc_substring: str) -> List[Dict[str, Any]]:
+                            desc_substring: str,
+                            timeout: int = DEFAULT_REQUEST_TIMEOUT) -> List[Dict[str, Any]]:
     """
     Retrieve Magic Transit routes that match a specific description pattern.
-    
+
     This is a utility function for querying routes without modifying them.
     Useful for monitoring, auditing, and validation operations.
-    
+
     Args:
         account_id (str): Cloudflare account ID
         token (str): Cloudflare API token with read permissions
         desc_substring (str): Substring to search for in route descriptions
+        timeout (int, optional): Request timeout in seconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
         
     Returns:
         List[Dict[str, Any]]: List of route objects matching the description filter
@@ -590,11 +599,11 @@ def get_routes_by_description(account_id: str,
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "User-Agent": "mt-gcp-daemon/1.0"
+        "User-Agent": "gcp-route-mgmt/1.0"
     }
     
     list_url = f"{CLOUDFLARE_API_BASE}/accounts/{account_id}/magic/routes"
-    r = requests.get(list_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT)
+    r = requests.get(list_url, headers=headers, timeout=timeout)
     r.raise_for_status()
     
     data = r.json()

@@ -31,24 +31,26 @@ def main():
             logger.info("Google Cloud Logging handler enabled.")
         except Exception as e:
             logger.warning(f"Could not enable Google Cloud Logging: {e}")
-
+            
+    exit_code = 0
     try:
         compute = startup(cfg)
         run_loop(cfg, compute)
     except SystemExit as e:
-        sys.exit(e.code if isinstance(e.code,int) else 1)
+        exit_code = e.code if isinstance(e.code, int) else 1
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
+        exit_code = 130
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+        exit_code = 1
     finally:
         for h in logger.handlers:
             try:
                 h.flush()
             except Exception:
                 pass
-        sys.exit(0)
+        sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

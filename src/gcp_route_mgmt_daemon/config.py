@@ -46,9 +46,31 @@ class Config:
 
         Runtime Control:
             - check_interval: Seconds between health checks.
-            - max_retries: Retry attempts on failure.
+            - max_retries: Legacy retry setting (deprecated, use per-service retries).
+            - max_retries_health_check: Retries for backend health checks (read-only, can be higher).
+            - max_retries_bgp_check: Retries for BGP session status checks.
+            - max_retries_bgp_update: Retries for BGP advertisement updates (modifies state, should be lower).
+            - max_retries_cloudflare: Retries for Cloudflare API calls.
             - initial_backoff / max_backoff: Exponential backoff timing.
             - cb_threshold / cb_timeout: Circuit breaker limits.
+            - run_passive: When TRUE, daemon runs but skips all route updates.
+
+        State Verification & Stability:
+            - state_2_verification_threshold: Consecutive State 2 detections required before acting (local unhealthy).
+            - state_3_verification_threshold: Consecutive State 3 detections required before acting (remote unhealthy).
+            - state_4_verification_threshold: Consecutive State 4 detections required before acting (both unhealthy).
+            - health_check_window: Number of recent health check results to track for hysteresis.
+            - health_check_threshold: Minimum healthy checks in window to consider region healthy.
+            - asymmetric_hysteresis: Use different thresholds for healthy→unhealthy vs unhealthy→healthy.
+            - min_state_dwell_time: Minimum seconds in a state before allowing transitions (prevents flapping).
+            - dwell_time_exception_states: State codes exempt from dwell time requirement (e.g., [1, 4]).
+
+        API Timeouts:
+            - gcp_api_timeout: General GCP API call timeout.
+            - gcp_backend_health_timeout: Backend health check timeout.
+            - gcp_bgp_operation_timeout: BGP advertisement update timeout.
+            - cloudflare_api_timeout: Cloudflare API request timeout.
+            - cloudflare_bulk_timeout: Cloudflare bulk update timeout.
     """
     # Logging
     logger_name: str = os.getenv('LOGGER_NAME', 'HEALTH_CHECK_DAEMON').upper()
@@ -89,11 +111,45 @@ class Config:
 
     # Control loop and retry settings
     check_interval: int = int(os.getenv('CHECK_INTERVAL_SECONDS', 60))
-    max_retries: int = int(os.getenv('MAX_RETRIES', 3))
+    # Per-service retry configuration for different operation types
+    max_retries_health_check: int = int(os.getenv('MAX_RETRIES_HEALTH_CHECK', 5))  # Health checks are read-only, can retry more
+    max_retries_bgp_check: int = int(os.getenv('MAX_RETRIES_BGP_CHECK', 4))       # BGP status checks
+    max_retries_bgp_update: int = int(os.getenv('MAX_RETRIES_BGP_UPDATE', 2))     # BGP updates modify state, retry less
+    max_retries_cloudflare: int = int(os.getenv('MAX_RETRIES_CLOUDFLARE', 3))     # Cloudflare updates
+    max_retries: int = int(os.getenv('MAX_RETRIES', 3))  # Legacy fallback, kept for backward compatibility
     initial_backoff: float = float(os.getenv('INITIAL_BACKOFF_SECONDS', 1.0))
     max_backoff: float = float(os.getenv('MAX_BACKOFF_SECONDS', 60.0))
     cb_threshold: int = int(os.getenv('CIRCUIT_BREAKER_THRESHOLD', 5))
     cb_timeout: int = int(os.getenv('CIRCUIT_BREAKER_TIMEOUT_SECONDS', 300))
+
+    # Passive mode - run daemon but skip all route updates
+    run_passive: bool = os.getenv('RUN_PASSIVE', 'false').lower() == 'true'
+
+    # State verification thresholds - require N consecutive detections before acting
+    state_2_verification_threshold: int = int(os.getenv('STATE_2_VERIFICATION_THRESHOLD', 2))
+    state_3_verification_threshold: int = int(os.getenv('STATE_3_VERIFICATION_THRESHOLD', 2))
+    state_4_verification_threshold: int = int(os.getenv('STATE_4_VERIFICATION_THRESHOLD', 2))
+
+    # Health check hysteresis - smooth out transient failures
+    health_check_window: int = int(os.getenv('HEALTH_CHECK_WINDOW', 5))
+    health_check_threshold: int = int(os.getenv('HEALTH_CHECK_THRESHOLD', 3))
+    asymmetric_hysteresis: bool = os.getenv('ASYMMETRIC_HYSTERESIS', 'false').lower() == 'true'
+
+    # State stability - minimum time in state before allowing transitions
+    min_state_dwell_time: int = int(os.getenv('MIN_STATE_DWELL_TIME', 120))
+
+    def __post_init__(self):
+        """Parse list-based configuration after initialization."""
+        # Parse dwell time exception states from comma-separated string
+        exception_states_str = os.getenv('DWELL_TIME_EXCEPTION_STATES', '1,4')
+        self.dwell_time_exception_states = [int(s.strip()) for s in exception_states_str.split(',')]
+
+    # API Timeout Configuration (seconds) - adjust based on network latency and deployment environment
+    gcp_api_timeout: int = int(os.getenv('GCP_API_TIMEOUT', 30))
+    gcp_backend_health_timeout: int = int(os.getenv('GCP_BACKEND_HEALTH_TIMEOUT', 45))
+    gcp_bgp_operation_timeout: int = int(os.getenv('GCP_BGP_OPERATION_TIMEOUT', 60))
+    cloudflare_api_timeout: int = int(os.getenv('CLOUDFLARE_API_TIMEOUT', 10))
+    cloudflare_bulk_timeout: int = int(os.getenv('CLOUDFLARE_BULK_TIMEOUT', 60))
 
 
 # List of required environment variables (presence-only validation)
@@ -152,12 +208,27 @@ def validate_configuration(cfg: Config) -> list[str]:
         'CLOUDFLARE_PRIMARY_PRIORITY': (1, 1000),
         'CLOUDFLARE_SECONDARY_PRIORITY': (1, 1000),
         'MAX_RETRIES': (1, 10),
+        'MAX_RETRIES_HEALTH_CHECK': (1, 10),
+        'MAX_RETRIES_BGP_CHECK': (1, 10),
+        'MAX_RETRIES_BGP_UPDATE': (1, 10),
+        'MAX_RETRIES_CLOUDFLARE': (1, 10),
         'INITIAL_BACKOFF_SECONDS': (0.1, 60),
         'MAX_BACKOFF_SECONDS': (1, 600),
         'CIRCUIT_BREAKER_THRESHOLD': (1, 20),
         'CIRCUIT_BREAKER_TIMEOUT_SECONDS': (30, 3600),
         'LOG_MAX_BYTES': (1024, 1073741824),  # 1 KB to 1 GB
         'LOG_BACKUP_COUNT': (1, 100),
+        'STATE_2_VERIFICATION_THRESHOLD': (1, 10),
+        'STATE_3_VERIFICATION_THRESHOLD': (1, 10),
+        'STATE_4_VERIFICATION_THRESHOLD': (1, 10),
+        'HEALTH_CHECK_WINDOW': (3, 10),
+        'HEALTH_CHECK_THRESHOLD': (1, 10),
+        'MIN_STATE_DWELL_TIME': (30, 600),
+        'GCP_API_TIMEOUT': (5, 300),
+        'GCP_BACKEND_HEALTH_TIMEOUT': (5, 300),
+        'GCP_BGP_OPERATION_TIMEOUT': (5, 300),
+        'CLOUDFLARE_API_TIMEOUT': (5, 300),
+        'CLOUDFLARE_BULK_TIMEOUT': (5, 300),
     }
 
     for var, (mn, mx) in numeric_ranges.items():
@@ -169,6 +240,11 @@ def validate_configuration(cfg: Config) -> list[str]:
                     errors.append(f"{var} must be between {mn} and {mx}, got {val}")
             except ValueError:
                 errors.append(f"{var} must be numeric, got '{raw}'")
+
+    # Validate constraint: health_check_threshold must be less than health_check_window
+    if cfg.health_check_threshold >= cfg.health_check_window:
+        errors.append(f"HEALTH_CHECK_THRESHOLD ({cfg.health_check_threshold}) must be less than "
+                     f"HEALTH_CHECK_WINDOW ({cfg.health_check_window})")
 
     # GCP credential file existence & readability
     creds = cfg.gcp_credentials

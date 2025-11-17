@@ -29,10 +29,14 @@ Health Check Flow:
     Local Region Health → Remote Region Health → BGP Status → State Code → LOCAL Actions
     
     State codes (see state.py for complete mapping):
+    - State 0: No change → Keep current advertisements and priorities (LOCAL - no action)
     - State 1: All healthy → Advertise primary only (LOCAL)
     - State 2: Local unhealthy → Failover mode (LOCAL withdrawal)
     - State 3: Remote unhealthy → Use local path (LOCAL advertise)
-    - State 4: Both unhealthy → Emergency mode (LOCAL advertise)
+    - State 4: Both unhealthy → Emergency mode with VERIFICATION REQUIRED
+      * First detection: No action taken, enter verification mode
+      * Subsequent detection: Apply emergency routing (LOCAL advertise)
+      * Threshold: 2 consecutive detections before action
     - State 5: BGP down + local unhealthy → Backup infrastructure (LOCAL advertise)
     - State 6: BGP down + all healthy → Use local path (LOCAL advertise)
 
@@ -148,7 +152,7 @@ def signal_handler(signum: int, frame) -> None:
     Example:
         # Signal handler is registered automatically by setup_signal_handlers()
         # When running as a service:
-        systemctl stop mt-gcp-daemon  # Sends SIGTERM
+        systemctl stop gcp-route-mgmt  # Sends SIGTERM
         
         # When running interactively:
         # Ctrl+C sends SIGINT
@@ -300,6 +304,7 @@ def run_loop(cfg: Config, compute) -> None:
     
     # Log daemon startup information
     logger.info(f"Daemon main loop starting with {cfg.check_interval}s check interval")
+    logger.info(f"Passive mode: {'ENABLED - monitoring only, no route updates' if cfg.run_passive else 'DISABLED - route updates enabled'}")
     logger.info(f"Monitoring regions - Local: {cfg.local_region}, Remote: {cfg.remote_region}")
     logger.info(f"Managing LOCAL router only - Primary: {cfg.primary_prefix}, Secondary: {cfg.secondary_prefix} on {cfg.local_bgp_router}")
     logger.info(f"Cloudflare integration - Account: {cfg.cf_account_id}, Filter: '{cfg.cf_desc_substring}'")
@@ -338,16 +343,48 @@ def run_loop(cfg: Config, compute) -> None:
     consecutive_errors = 0
     max_consecutive_errors = 10
     current_state_code = None  # Track state changes
+    
+    # State verification tracking (requires confirmation before acting)
+    state_2_pending_verification = False
+    state_2_consecutive_count = 0
+    state_3_pending_verification = False
+    state_3_consecutive_count = 0
+    state_4_pending_verification = False
+    state_4_consecutive_count = 0
+
+    # Health check hysteresis tracking (smooth out transient failures)
+    from collections import deque
+    local_health_history = deque(maxlen=cfg.health_check_window)
+    remote_health_history = deque(maxlen=cfg.health_check_window)
+
+    # State dwell time tracking (prevent rapid state transitions)
+    last_state_change_time = time.time()
+    time_in_current_state = 0
 
     # Log daemon startup event for observability
     startup_details = {
         "check_interval": cfg.check_interval,
+        "passive_mode": cfg.run_passive,
         "local_region": cfg.local_region,
         "remote_region": cfg.remote_region,
         "primary_prefix": cfg.primary_prefix,
         "local_router_only": True,  # Flag to indicate this is local-only mode
         "circuit_breaker_threshold": cfg.cb_threshold,
-        "circuit_breaker_timeout": cfg.cb_timeout
+        "circuit_breaker_timeout": cfg.cb_timeout,
+        "state_verification": {
+            "state_2_threshold": cfg.state_2_verification_threshold,
+            "state_3_threshold": cfg.state_3_verification_threshold,
+            "state_4_threshold": cfg.state_4_verification_threshold
+        },
+        "health_check_hysteresis": {
+            "window": cfg.health_check_window,
+            "threshold": cfg.health_check_threshold,
+            "asymmetric": cfg.asymmetric_hysteresis
+        },
+        "state_dwell_time": {
+            "minimum_seconds": cfg.min_state_dwell_time,
+            "exception_states": cfg.dwell_time_exception_states
+        }
     }
     
     structured_logger.log_event({
@@ -379,7 +416,7 @@ def run_loop(cfg: Config, compute) -> None:
             
             # Check local region backend service health
             # Uses circuit breaker + retry for resilience
-            local_healthy = circuit_breakers['gcp_health'].call(
+            raw_local_healthy = circuit_breakers['gcp_health'].call(
                 lambda: exponential_backoff_retry(
                     gcp_mod.backend_services_healthy(
                         cfg.gcp_project,
@@ -387,14 +424,14 @@ def run_loop(cfg: Config, compute) -> None:
                         compute,
                         structured_logger
                     ),
-                    max_retries=cfg.max_retries,
+                    max_retries=cfg.max_retries_health_check,
                     initial_delay=cfg.initial_backoff,
                     max_delay=cfg.max_backoff
                 )
             )
 
             # Check remote region backend service health
-            remote_healthy = circuit_breakers['gcp_health'].call(
+            raw_remote_healthy = circuit_breakers['gcp_health'].call(
                 lambda: exponential_backoff_retry(
                     gcp_mod.backend_services_healthy(
                         cfg.gcp_project,
@@ -402,11 +439,62 @@ def run_loop(cfg: Config, compute) -> None:
                         compute,
                         structured_logger
                     ),
-                    max_retries=cfg.max_retries,
+                    max_retries=cfg.max_retries_health_check,
                     initial_delay=cfg.initial_backoff,
                     max_delay=cfg.max_backoff
                 )
             )
+
+            # Apply health check hysteresis to smooth out transient failures
+            # Add raw results to history
+            local_health_history.append(raw_local_healthy)
+            remote_health_history.append(raw_remote_healthy)
+
+            # Apply hysteresis logic if we have enough history
+            if len(local_health_history) >= cfg.health_check_window:
+                healthy_count = sum(local_health_history)
+
+                if cfg.asymmetric_hysteresis:
+                    # Asymmetric: Different thresholds for up vs down transitions
+                    if current_state_code in [1, 3, 6]:  # States where local is considered healthy
+                        # Need multiple failures to declare unhealthy
+                        local_healthy = healthy_count >= 2  # Allow up to 3 failures in window of 5
+                    else:  # Currently unhealthy states (2, 4, 5)
+                        # Need strong majority to declare healthy
+                        local_healthy = healthy_count >= 4  # Need 4 successes out of 5
+                else:
+                    # Symmetric: Simple majority rule
+                    local_healthy = healthy_count >= cfg.health_check_threshold
+
+                logger.debug(f"[{correlation_id}] Local health hysteresis applied: "
+                           f"{healthy_count}/{cfg.health_check_window} healthy checks -> "
+                           f"local_healthy={local_healthy} (raw={raw_local_healthy})")
+            else:
+                # Not enough history yet, use raw result
+                local_healthy = raw_local_healthy
+                logger.debug(f"[{correlation_id}] Local health: {local_healthy} "
+                           f"(insufficient history: {len(local_health_history)}/{cfg.health_check_window})")
+
+            # Apply same hysteresis logic for remote
+            if len(remote_health_history) >= cfg.health_check_window:
+                healthy_count = sum(remote_health_history)
+
+                if cfg.asymmetric_hysteresis:
+                    # Check if remote is considered healthy in current state
+                    if current_state_code in [1, 2, 6]:  # States where remote is considered healthy
+                        remote_healthy = healthy_count >= 2  # Allow up to 3 failures
+                    else:  # Currently unhealthy states (3, 4)
+                        remote_healthy = healthy_count >= 4  # Need 4 successes
+                else:
+                    remote_healthy = healthy_count >= cfg.health_check_threshold
+
+                logger.debug(f"[{correlation_id}] Remote health hysteresis applied: "
+                           f"{healthy_count}/{cfg.health_check_window} healthy checks -> "
+                           f"remote_healthy={remote_healthy} (raw={raw_remote_healthy})")
+            else:
+                remote_healthy = raw_remote_healthy
+                logger.debug(f"[{correlation_id}] Remote health: {remote_healthy} "
+                           f"(insufficient history: {len(remote_health_history)}/{cfg.health_check_window})")
 
             # ═══════════════════════════════════════════════════════════════════════════
             # PHASE 2: BGP Session Health Check
@@ -425,7 +513,7 @@ def run_loop(cfg: Config, compute) -> None:
                         compute,
                         structured_logger
                     ),
-                    max_retries=cfg.max_retries,
+                    max_retries=cfg.max_retries_bgp_check,
                     initial_delay=cfg.initial_backoff,
                     max_delay=cfg.max_backoff
                 )
@@ -446,12 +534,158 @@ def run_loop(cfg: Config, compute) -> None:
             # Use state machine to determine routing actions based on health combination
             new_state_code = determine_state_code(local_healthy, remote_healthy, remote_bgp_up)
             advertise_primary, advertise_secondary = STATE_ACTIONS.get(new_state_code, (False, False))
+
+            # ═══════════════════════════════════════════════════════════════════════════
+            # State Dwell Time Enforcement (prevent rapid state transitions)
+            # ═══════════════════════════════════════════════════════════════════════════
+
+            # Calculate time in current state
+            if current_state_code == new_state_code:
+                time_in_current_state = time.time() - last_state_change_time
+            else:
+                time_in_current_state = 0  # State is changing
+
+            # Check if state transition should be blocked by dwell time requirement
+            if (new_state_code != current_state_code and
+                current_state_code is not None and
+                time_in_current_state < cfg.min_state_dwell_time and
+                current_state_code not in cfg.dwell_time_exception_states and
+                new_state_code not in cfg.dwell_time_exception_states):
+
+                logger.warning(f"State transition blocked [{correlation_id}]: "
+                              f"Only {time_in_current_state:.1f}s in state {current_state_code} "
+                              f"(minimum: {cfg.min_state_dwell_time}s). "
+                              f"Remaining in current state.")
+
+                # Force remain in current state
+                new_state_code = current_state_code
+                advertise_primary, advertise_secondary = STATE_ACTIONS.get(new_state_code, (False, False))
+
+                # Log dwell time enforcement
+                structured_logger.log_custom_event(
+                    "dwell_time_enforced",
+                    {
+                        "attempted_transition": f"{current_state_code} -> {new_state_code}",
+                        "time_in_state": time_in_current_state,
+                        "minimum_required": cfg.min_state_dwell_time
+                    }
+                )
+
+            # ═══════════════════════════════════════════════════════════════════════════
+            # State Verification (require consecutive detections before acting)
+            # ═══════════════════════════════════════════════════════════════════════════
+
+            skip_updates = False
+            verification_reason = None
+
+            # Check for passive mode first - overrides all state logic
+            if cfg.run_passive:
+                logger.info(f"Passive mode enabled [{correlation_id}] - daemon will monitor but not update routes")
+                skip_updates = True
+                advertise_primary = None
+                advertise_secondary = None
+                verification_reason = "PASSIVE MODE"
+
+            # State 0 (failsafe/default - no changes)
+            # Triggered when health status is unreliable or unexpected combinations
+            elif new_state_code == 0:
+                logger.info(f"State 0 detected [{correlation_id}] - failsafe mode (no route changes). "
+                           f"Maintaining current routing state due to unreliable health data or unexpected conditions.")
+                skip_updates = True
+                advertise_primary = None
+                advertise_secondary = None
+                verification_reason = "STATE 0 - FAILSAFE (no route changes)"
+
+            # State 2 verification (local unhealthy, remote healthy)
+            elif new_state_code == 2:
+                if new_state_code == current_state_code:
+                    state_2_consecutive_count += 1
+                else:
+                    state_2_consecutive_count = 1
+                    state_2_pending_verification = True
+
+                if state_2_consecutive_count < cfg.state_2_verification_threshold:
+                    logger.warning(f"State 2 detected [{correlation_id}] but requires verification "
+                                 f"({state_2_consecutive_count}/{cfg.state_2_verification_threshold}). "
+                                 f"Skipping route updates until verified.")
+                    skip_updates = True
+                    advertise_primary = None
+                    advertise_secondary = None
+                    verification_reason = "STATE 2 VERIFICATION PENDING"
+                else:
+                    logger.info(f"State 2 VERIFIED [{correlation_id}] after "
+                               f"{state_2_consecutive_count} consecutive cycles. "
+                               f"Applying failover routing actions.")
+                    state_2_pending_verification = False
+
+            # State 3 verification (local healthy, remote unhealthy)
+            elif new_state_code == 3:
+                if new_state_code == current_state_code:
+                    state_3_consecutive_count += 1
+                else:
+                    state_3_consecutive_count = 1
+                    state_3_pending_verification = True
+
+                if state_3_consecutive_count < cfg.state_3_verification_threshold:
+                    logger.warning(f"State 3 detected [{correlation_id}] but requires verification "
+                                 f"({state_3_consecutive_count}/{cfg.state_3_verification_threshold}). "
+                                 f"Skipping route updates until verified.")
+                    skip_updates = True
+                    advertise_primary = None
+                    advertise_secondary = None
+                    verification_reason = "STATE 3 VERIFICATION PENDING"
+                else:
+                    logger.info(f"State 3 VERIFIED [{correlation_id}] after "
+                               f"{state_3_consecutive_count} consecutive cycles. "
+                               f"Applying redundant routing actions.")
+                    state_3_pending_verification = False
+
+            # State 4 verification (both regions unhealthy) - emergency mode
+            elif new_state_code == 4:
+                if new_state_code == current_state_code:
+                    state_4_consecutive_count += 1
+                else:
+                    state_4_consecutive_count = 1
+                    state_4_pending_verification = True
+
+                if state_4_consecutive_count < cfg.state_4_verification_threshold:
+                    logger.warning(f"State 4 detected [{correlation_id}] but requires verification "
+                                 f"({state_4_consecutive_count}/{cfg.state_4_verification_threshold}). "
+                                 f"Skipping route updates until verified.")
+                    skip_updates = True
+                    advertise_primary = None
+                    advertise_secondary = None
+                    verification_reason = "STATE 4 VERIFICATION PENDING"
+                else:
+                    logger.warning(f"State 4 VERIFIED [{correlation_id}] after "
+                                 f"{state_4_consecutive_count} consecutive cycles. "
+                                 f"Applying emergency routing actions.")
+                    state_4_pending_verification = False
+
+            # Reset verification counters for states we're not in
+            if new_state_code != 2:
+                if state_2_consecutive_count > 0:
+                    logger.info(f"Exited State 2 after {state_2_consecutive_count} cycles")
+                state_2_consecutive_count = 0
+                state_2_pending_verification = False
+
+            if new_state_code != 3:
+                if state_3_consecutive_count > 0:
+                    logger.info(f"Exited State 3 after {state_3_consecutive_count} cycles")
+                state_3_consecutive_count = 0
+                state_3_pending_verification = False
+
+            if new_state_code != 4:
+                if state_4_consecutive_count > 0:
+                    logger.info(f"Exited State 4 after {state_4_consecutive_count} cycles")
+                state_4_consecutive_count = 0
+                state_4_pending_verification = False
             
             # Log state transition if changed (for audit and debugging)
             if current_state_code != new_state_code:
                 logger.info(f"State transition [{correlation_id}]: "
                            f"{current_state_code} -> {new_state_code}")
-                
+
                 structured_logger.log_state_transition(
                     old_state=current_state_code or 0,
                     new_state=new_state_code,
@@ -461,101 +695,130 @@ def run_loop(cfg: Config, compute) -> None:
                     planned_actions=(advertise_primary, advertise_secondary)
                 )
                 current_state_code = new_state_code
-            
+                # Update state change time for dwell time tracking
+                last_state_change_time = time.time()
+
             # UPDATED: Log both local BGP actions since we manage both prefixes locally
-            logger.info(f"State {new_state_code} [{correlation_id}] -> "
-                       f"Local BGP Primary ({cfg.primary_prefix}): {advertise_primary}, "
-                       f"Local BGP Secondary ({cfg.secondary_prefix}): {advertise_secondary}")
+            if cfg.run_passive:
+                logger.info(f"State {new_state_code} [{correlation_id}] -> "
+                           f"PASSIVE MODE - No route updates will be performed")
+            elif skip_updates:
+                logger.info(f"State {new_state_code} [{correlation_id}] -> "
+                           f"{verification_reason} - No route updates will be performed")
+            else:
+                logger.info(f"State {new_state_code} [{correlation_id}] -> "
+                           f"Local BGP Primary ({cfg.primary_prefix}): {advertise_primary}, "
+                           f"Local BGP Secondary ({cfg.secondary_prefix}): {advertise_secondary}")
 
             # ═══════════════════════════════════════════════════════════════════════════
             # PHASE 4: LOCAL BGP Route Advertisement Updates (PRIMARY AND SECONDARY)
             # ═══════════════════════════════════════════════════════════════════════════
-            
-            logger.debug(f"[{correlation_id}] Updating LOCAL BGP route advertisements")
-            
-            # Update primary prefix advertisement on local router
-            primary_success = circuit_breakers['gcp_local_advertisement'].call(
-                lambda: exponential_backoff_retry(
-                    gcp_mod.update_bgp_advertisement(
-                        project=cfg.bgp_peer_project,
-                        region=cfg.local_bgp_region,
-                        router=cfg.local_bgp_router,
-                        prefix=cfg.primary_prefix,
-                        compute_client=compute,
-                        advertise=advertise_primary,
-                        structured_logger=structured_logger
-                    ),
-                    max_retries=cfg.max_retries,
-                    initial_delay=cfg.initial_backoff,
-                    max_delay=cfg.max_backoff
-                )
-            )
 
-            # Update secondary prefix advertisement on local router
-            secondary_success = circuit_breakers['gcp_local_advertisement'].call(
-                lambda: exponential_backoff_retry(
-                    gcp_mod.update_bgp_advertisement(
-                        project=cfg.bgp_peer_project,
-                        region=cfg.local_bgp_region,  # Same local router
-                        router=cfg.local_bgp_router,   # Same local router
-                        prefix=cfg.secondary_prefix,   # But secondary prefix
-                        compute_client=compute,
-                        advertise=advertise_secondary,  # Based on state logic
-                        structured_logger=structured_logger
-                    ),
-                    max_retries=cfg.max_retries,
-                    initial_delay=cfg.initial_backoff,
-                    max_delay=cfg.max_backoff
+            # Skip BGP updates if verification pending or passive mode
+            if skip_updates:
+                reason = verification_reason or "Verification pending"
+                logger.info(f"[{correlation_id}] Skipping LOCAL BGP route advertisement updates ({reason})")
+                primary_success = True  # Consider skipped operations successful
+                secondary_success = True
+            else:
+                logger.debug(f"[{correlation_id}] Updating LOCAL BGP route advertisements")
+                
+                # Update primary prefix advertisement on local router
+                primary_success = circuit_breakers['gcp_local_advertisement'].call(
+                    lambda: exponential_backoff_retry(
+                        gcp_mod.update_bgp_advertisement(
+                            project=cfg.bgp_peer_project,
+                            region=cfg.local_bgp_region,
+                            router=cfg.local_bgp_router,
+                            prefix=cfg.primary_prefix,
+                            compute_client=compute,
+                            advertise=advertise_primary,
+                            structured_logger=structured_logger
+                        ),
+                        max_retries=cfg.max_retries_bgp_update,
+                        initial_delay=cfg.initial_backoff,
+                        max_delay=cfg.max_backoff
+                    )
                 )
-            )
 
-            logger.info(f"[{correlation_id}] Local BGP updates completed - "
-                       f"Primary ({cfg.primary_prefix}): {advertise_primary}, "
-                       f"Secondary ({cfg.secondary_prefix}): {advertise_secondary}")
+                # Update secondary prefix advertisement on local router
+                secondary_success = circuit_breakers['gcp_local_advertisement'].call(
+                    lambda: exponential_backoff_retry(
+                        gcp_mod.update_bgp_advertisement(
+                            project=cfg.bgp_peer_project,
+                            region=cfg.local_bgp_region,  # Same local router
+                            router=cfg.local_bgp_router,   # Same local router
+                            prefix=cfg.secondary_prefix,   # But secondary prefix
+                            compute_client=compute,
+                            advertise=advertise_secondary,  # Based on state logic
+                            structured_logger=structured_logger
+                        ),
+                        max_retries=cfg.max_retries_bgp_update,
+                        initial_delay=cfg.initial_backoff,
+                        max_delay=cfg.max_backoff
+                    )
+                )
+
+                logger.info(f"[{correlation_id}] Local BGP updates completed - "
+                           f"Primary ({cfg.primary_prefix}): {advertise_primary}, "
+                           f"Secondary ({cfg.secondary_prefix}): {advertise_secondary}")
 
             # ═══════════════════════════════════════════════════════════════════════════
             # PHASE 5: Cloudflare Route Priority Updates
             # ═══════════════════════════════════════════════════════════════════════════
             
-            logger.debug(f"[{correlation_id}] Updating Cloudflare route priorities")
-            
-            # Determine desired priority based on local region health
-            # Lower priority number = higher priority in Cloudflare
-            desired_priority = (cfg.cf_primary_priority if local_healthy
-                              else cfg.cf_secondary_priority)
-            
-            logger.debug(f"[{correlation_id}] Setting Cloudflare priority to {desired_priority} "
-                        f"(local_healthy={local_healthy})")
-            
-            # Update Cloudflare route priorities for matching routes
-            cloudflare_success = circuit_breakers['cloudflare'].call(
-                lambda: exponential_backoff_retry(
-                    lambda: cf_mod.update_routes_by_description_bulk(
-                        account_id=cfg.cf_account_id,
-                        token=cfg.cf_api_token,
-                        desc_substring=cfg.cf_desc_substring,
-                        desired_priority=desired_priority,
-                        structured_logger=structured_logger
-                    ),
-                    max_retries=cfg.max_retries,
-                    initial_delay=cfg.initial_backoff,
-                    max_delay=cfg.max_backoff
+            # Skip Cloudflare updates if we're in passive mode or State 4 verification mode
+            if skip_updates:
+                reason = "Passive mode" if cfg.run_passive else "State 4 verification pending"
+                logger.info(f"[{correlation_id}] Skipping Cloudflare route priority updates ({reason})")
+                cloudflare_success = True
+                desired_priority = None  # Indicate no action taken
+            else:
+                logger.debug(f"[{correlation_id}] Updating Cloudflare route priorities")
+                
+                # Determine desired priority based on local region health
+                # Lower priority number = higher priority in Cloudflare
+                desired_priority = (cfg.cf_primary_priority if local_healthy
+                                  else cfg.cf_secondary_priority)
+                
+                logger.debug(f"[{correlation_id}] Setting Cloudflare priority to {desired_priority} "
+                            f"(local_healthy={local_healthy})")
+                
+                # Update Cloudflare route priorities for matching routes
+                cloudflare_success = circuit_breakers['cloudflare'].call(
+                    lambda: exponential_backoff_retry(
+                        lambda: cf_mod.update_routes_by_description_bulk(
+                            account_id=cfg.cf_account_id,
+                            token=cfg.cf_api_token,
+                            desc_substring=cfg.cf_desc_substring,
+                            desired_priority=desired_priority,
+                            structured_logger=structured_logger,
+                            timeout=cfg.cloudflare_api_timeout,
+                            bulk_timeout=cfg.cloudflare_bulk_timeout
+                        ),
+                        max_retries=cfg.max_retries_cloudflare,
+                        initial_delay=cfg.initial_backoff,
+                        max_delay=cfg.max_backoff
+                    )
                 )
-            )
 
             # ═══════════════════════════════════════════════════════════════════════════
             # PHASE 6: Cycle Completion and Status Logging
             # ═══════════════════════════════════════════════════════════════════════════
-            
+
             # Determine overall cycle success (both local prefix operations matter now)
             cycle_success = primary_success and secondary_success and cloudflare_success
-            
-            # Update consecutive error tracking
-            if cycle_success:
-                consecutive_errors = 0
+
+            # Determine cycle result for structured logging
+            if skip_updates:
+                # Operations were skipped (passive mode or State 4 verification)
+                cycle_result = ActionResult.SKIPPED
+                logger.info(f"Health check cycle {correlation_id} completed (operations skipped)")
+            elif cycle_success:
+                cycle_result = ActionResult.SUCCESS
                 logger.info(f"Health check cycle {correlation_id} completed successfully")
             else:
-                consecutive_errors += 1
+                cycle_result = ActionResult.FAILURE
                 failed_operations = []
                 if not primary_success:
                     failed_operations.append("local_primary_bgp")
@@ -563,10 +826,16 @@ def run_loop(cfg: Config, compute) -> None:
                     failed_operations.append("local_secondary_bgp")
                 if not cloudflare_success:
                     failed_operations.append("cloudflare")
-                
+
                 logger.warning(f"Health check cycle {correlation_id} had failures "
                              f"({consecutive_errors}/{max_consecutive_errors}): "
                              f"{', '.join(failed_operations)}")
+
+            # Update consecutive error tracking (skipped operations are not errors)
+            if skip_updates or cycle_success:
+                consecutive_errors = 0
+            else:
+                consecutive_errors += 1
 
             # Calculate cycle performance metrics
             loop_duration = time.time() - loop_start
@@ -576,26 +845,59 @@ def run_loop(cfg: Config, compute) -> None:
                 "correlation_id": correlation_id,
                 "cycle_duration_ms": int(loop_duration * 1000),
                 "state_code": new_state_code,
+                "time_in_state_seconds": time_in_current_state,
                 "local_router_only_mode": True,  # Flag for monitoring
+                "state_verification": {
+                    "state_2": {
+                        "pending": state_2_pending_verification,
+                        "consecutive_count": state_2_consecutive_count,
+                        "threshold": cfg.state_2_verification_threshold
+                    } if new_state_code == 2 or state_2_consecutive_count > 0 else None,
+                    "state_3": {
+                        "pending": state_3_pending_verification,
+                        "consecutive_count": state_3_consecutive_count,
+                        "threshold": cfg.state_3_verification_threshold
+                    } if new_state_code == 3 or state_3_consecutive_count > 0 else None,
+                    "state_4": {
+                        "pending": state_4_pending_verification,
+                        "consecutive_count": state_4_consecutive_count,
+                        "threshold": cfg.state_4_verification_threshold
+                    } if new_state_code == 4 or state_4_consecutive_count > 0 else None,
+                    "updates_skipped": skip_updates,
+                    "skip_reason": verification_reason
+                },
+                "health_check_hysteresis": {
+                    "local_history_size": len(local_health_history),
+                    "local_healthy_count": sum(local_health_history) if local_health_history else 0,
+                    "remote_history_size": len(remote_health_history),
+                    "remote_healthy_count": sum(remote_health_history) if remote_health_history else 0,
+                    "window_size": cfg.health_check_window,
+                    "threshold": cfg.health_check_threshold,
+                    "asymmetric": cfg.asymmetric_hysteresis
+                },
                 "health_status": {
                     "local_healthy": local_healthy,
                     "remote_healthy": remote_healthy,
-                    "remote_bgp_up": remote_bgp_up
+                    "remote_bgp_up": remote_bgp_up,
+                    "raw_local_healthy": raw_local_healthy,
+                    "raw_remote_healthy": raw_remote_healthy
                 },
                 "operation_results": {
                     "local_primary_advertisement_success": primary_success,
                     "local_secondary_advertisement_success": secondary_success,
                     "cloudflare_update_success": cloudflare_success,
-                    "remote_advertisement_skipped": True
+                    "remote_advertisement_skipped": True,
+                    "bgp_updates_skipped": skip_updates,  # Flag for State 0
+                    "cloudflare_updates_skipped": skip_updates  # Flag for State 0
                 },
                 "error_tracking": {
                     "consecutive_errors": consecutive_errors,
                     "max_consecutive_errors": max_consecutive_errors
                 },
                 "configuration": {
-                    "desired_cloudflare_priority": desired_priority,
-                    "planned_primary_advertisement": advertise_primary,
-                    "planned_secondary_advertisement": advertise_secondary,
+                    "desired_cloudflare_priority": desired_priority if desired_priority is not None else "no_change",
+                    "planned_primary_advertisement": advertise_primary if advertise_primary is not None else "no_change",
+                    "planned_secondary_advertisement": advertise_secondary if advertise_secondary is not None else "no_change",
                     "local_router_manages_both_prefixes": True,
                     "remote_advertisement_managed": False
                 }
@@ -604,7 +906,7 @@ def run_loop(cfg: Config, compute) -> None:
             structured_logger.log_event({
                 "event_type": "health_check_cycle",
                 "timestamp": time.time(),
-                "result": ActionResult.SUCCESS.value if cycle_success else ActionResult.FAILURE.value,
+                "result": cycle_result.value,
                 "component": "daemon",
                 "operation": "health_check_cycle",
                 "details": cycle_details,
@@ -838,7 +1140,7 @@ def startup(cfg: Config):
     try:
         # Build authenticated GCP Compute Engine client
         logger.debug(f"Building GCP client with credentials: {cfg.gcp_credentials}")
-        compute = gcp_mod.build_compute_client(cfg.gcp_credentials)
+        compute = gcp_mod.build_compute_client(cfg.gcp_credentials, timeout=cfg.gcp_api_timeout)
         
         # Test connectivity and permissions
         logger.debug(f"Testing GCP connectivity for project: {cfg.gcp_project}")
@@ -923,7 +1225,7 @@ def startup(cfg: Config):
     try:
         # Test Cloudflare API connectivity and permissions
         logger.debug(f"Testing Cloudflare connectivity for account: {cfg.cf_account_id}")
-        cf_mod.validate_cloudflare_connectivity(cfg.cf_account_id, cfg.cf_api_token)
+        cf_mod.validate_cloudflare_connectivity(cfg.cf_account_id, cfg.cf_api_token, timeout=cfg.cloudflare_api_timeout)
         
         # Log successful Cloudflare connectivity
         cf_details = {
@@ -991,6 +1293,7 @@ def startup(cfg: Config):
     startup_summary = {
         "configuration": {
             "check_interval": cfg.check_interval,
+            "passive_mode": cfg.run_passive,
             "circuit_breaker_threshold": cfg.cb_threshold,
             "circuit_breaker_timeout": cfg.cb_timeout,
             "max_retries": cfg.max_retries,
@@ -1029,16 +1332,20 @@ def startup(cfg: Config):
     })
     
     logger.info("🚀 Daemon startup completed successfully - all validations passed")
-    logger.info("Ready to begin health monitoring and LOCAL route management")
-    logger.info(f"NOTE: This daemon will only manage BGP advertisements on {cfg.local_bgp_router}")
-    logger.info(f"      Remote router {cfg.remote_bgp_router} will be monitored but not modified")
-    
+    if cfg.run_passive:
+        logger.warning("⚠️  PASSIVE MODE ENABLED - Daemon will monitor but NOT update any routes")
+        logger.warning("   To enable route updates, set RUN_PASSIVE=FALSE in .env file")
+    else:
+        logger.info("Ready to begin health monitoring and LOCAL route management")
+        logger.info(f"NOTE: This daemon will only manage BGP advertisements on {cfg.local_bgp_router}")
+        logger.info(f"      Remote router {cfg.remote_bgp_router} will be monitored but not modified")
+
     return compute
 
 
 # Module-level constants and configuration
-DAEMON_VERSION = "1.1.0"  # Updated version for local-only mode
-DAEMON_NAME = "MT GCP Health Check Daemon (Local Router Only)"
+DAEMON_VERSION = "0.5.1"
+DAEMON_NAME = "GCP route magement daemon (Local Router Only)"
 
 # Health check timing constants
 MIN_CHECK_INTERVAL = 10     # Minimum seconds between health checks
@@ -1132,7 +1439,7 @@ if __name__ == "__main__":
     """
     Direct execution support for testing and development.
     
-    When this module is run directly (python -m mt_gcp_daemon.daemon),
+    When this module is run directly (python -m gcp_route_mgmt_daemon.daemon),
     it will load configuration and start the daemon. This is useful for:
     
     - Development and testing
@@ -1141,7 +1448,7 @@ if __name__ == "__main__":
     - Validation of startup process
     
     For production deployment, use the main module entry point:
-    python -m mt_gcp_daemon
+    python -m gcp_route_mgmt_daemon
     """
     import sys
     from .config import Config

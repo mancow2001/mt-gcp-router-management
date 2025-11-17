@@ -104,7 +104,7 @@ Monitoring and Alerting:
 
 Author: Nathan Bray
 Version: 1.0
-Last Modified: 2025
+Last Modified: 2024
 Dependencies: google-cloud-compute, google-auth, googleapiclient
 """
 
@@ -137,29 +137,33 @@ PERMANENT_HTTP_ERRORS = [403, 404]        # Errors that indicate configuration i
 TRANSIENT_HTTP_ERRORS = [429, 500, 502, 503, 504]  # Errors that may be retried
 
 
-def build_compute_client(creds_path: str):
+def build_compute_client(creds_path: str, timeout: int = DEFAULT_API_TIMEOUT):
     """
     Initialize a Google Compute Engine API client using service account credentials.
-    
+
     This function creates an authenticated client for the Compute Engine API using
     service account credentials from a JSON key file. The client is configured with
     appropriate defaults for production use.
-    
+
     The returned client can be used for all Compute Engine operations including:
     - Backend service health monitoring
     - Cloud Router BGP management
     - Regional resource queries
-    
+
     Authentication:
         Uses OAuth 2.0 service account authentication with JSON key file.
         The service account must have appropriate IAM permissions for the
         intended operations.
-    
+
     Args:
         creds_path (str): Absolute or relative path to the service account JSON key file.
             The file must be readable by the current process and contain valid
             service account credentials.
-            
+        timeout (int, optional): [Deprecated/Unused] HTTP request timeout parameter.
+            Kept for backward compatibility but no longer used in Python 3.12+.
+            The modern google-api-python-client handles timeouts internally.
+            Defaults to DEFAULT_API_TIMEOUT.
+
     Returns:
         googleapiclient.discovery.Resource: Authenticated Compute Engine API client
             configured for version v1. The client includes built-in retry logic
@@ -186,6 +190,11 @@ def build_compute_client(creds_path: str):
         - Client includes connection pooling for subsequent API calls
         - Discovery document is cached to improve startup time
         - Recommended to create client once and reuse throughout application lifecycle
+
+    Python 3.12+ Compatibility:
+        - Uses modern credentials-based authentication (credentials parameter)
+        - Compatible with google-auth 2.x and google-api-python-client 2.x
+        - No longer uses deprecated httplib2.Http().authorize() method
         
     Example:
         # Basic usage
@@ -227,11 +236,12 @@ def build_compute_client(creds_path: str):
     
     try:
         logger.debug(f"Loading GCP service account credentials from: {creds_path}")
-        
+
         # Load service account credentials from JSON key file
         creds = service_account.Credentials.from_service_account_file(creds_path)
-        
+
         # Build Compute Engine API client with credentials
+        # Python 3.12+ compatible: pass credentials directly instead of using authorize()
         # cache_discovery=False prevents caching discovery documents to disk
         compute = build(
             serviceName='compute',
@@ -627,16 +637,27 @@ def backend_services_healthy(project: str,
                                  f"{unhealthy_count} unhealthy backends out of {details['total_backends']}")
                         
         except HttpError as e:
-            healthy = False
             details["error_code"] = e.resp.status
             details["error_reason"] = str(e)
-            
-            # Handle permanent vs transient errors differently
+
+            # Handle permanent vs transient/unknown errors differently
             if e.resp.status in PERMANENT_HTTP_ERRORS:
                 logger.error(f"Permanent error checking backend health for {project}/{region}: {e}")
                 raise  # Re-raise permanent errors for immediate attention
+            elif e.resp.status in TRANSIENT_HTTP_ERRORS:
+                # Known transient errors - temporary API issues, monitoring unreliable
+                logger.warning(f"Transient HTTP error ({e.resp.status}) checking backend health "
+                             f"for {project}/{region}. Monitoring temporarily unreliable - "
+                             f"will maintain current routing state: {e}")
+                details["monitoring_unavailable"] = True
+                healthy = None  # Monitoring unreliable -> unknown health
             else:
-                logger.warning(f"Transient HTTP error checking backend health for {project}/{region}: {e}")
+                # Unknown/unexpected error code - don't make routing changes based on unknown errors
+                logger.warning(f"Unknown HTTP error code {e.resp.status} checking backend health "
+                             f"for {project}/{region}. Cannot determine backend health with unexpected "
+                             f"error - will maintain current routing state: {e}")
+                details["monitoring_unavailable"] = True
+                healthy = None  # Unknown error -> unknown health
                 
         except Exception as e:
             healthy = False
@@ -836,15 +857,26 @@ def router_bgp_sessions_healthy(project: str,
         except HttpError as e:
             details["error_code"] = e.resp.status
             details["error_reason"] = str(e)
-            
-            # Handle permanent vs transient errors
+
+            # Handle permanent vs transient/unknown errors differently
             if e.resp.status in PERMANENT_HTTP_ERRORS:
                 logger.error(f"Permanent error checking BGP sessions for router {router} "
                            f"in {project}/{region}: {e}")
-                raise  # Re-raise permanent errors
+                raise  # Re-raise permanent errors for immediate attention
+            elif e.resp.status in TRANSIENT_HTTP_ERRORS:
+                # Known transient errors - temporary API issues, monitoring unreliable
+                logger.warning(f"Transient HTTP error ({e.resp.status}) checking BGP sessions "
+                             f"for router {router} in {project}/{region}. Monitoring temporarily "
+                             f"unreliable - will maintain current routing state: {e}")
+                details["monitoring_unavailable"] = True
+                any_up = None  # Monitoring unreliable -> unknown health
             else:
-                logger.warning(f"Transient HTTP error checking BGP sessions for router {router} "
-                             f"in {project}/{region}: {e}")
+                # Unknown/unexpected error code - don't make routing changes based on unknown errors
+                logger.warning(f"Unknown HTTP error code {e.resp.status} checking BGP sessions "
+                             f"for router {router} in {project}/{region}. Cannot determine BGP "
+                             f"health with unexpected error - will maintain current routing state: {e}")
+                details["monitoring_unavailable"] = True
+                any_up = None  # Unknown error -> unknown health
                 
         except Exception as e:
             details["error_reason"] = str(e)
@@ -1001,18 +1033,25 @@ def update_bgp_advertisement(project: str,
     def _update() -> bool:
         """
         Internal BGP advertisement update function that performs the router modification.
-        
+
         Returns:
             bool: True if operation succeeded or no change was needed,
                   False if operation failed
         """
+        # Handle None (no change requested) - State 0 failsafe behavior
+        # None means "maintain current state" - no BGP updates should be performed
+        if advertise is None:
+            logger.debug(f"No BGP advertisement change requested for {prefix} on router {router} "
+                        f"(advertise=None indicates State 0 or no-change scenario)")
+            return True  # No-op is considered success
+
         start_time = time.time()
         success = False
         operation_id = None
         error_message = None
         action = "advertise" if advertise else "withdraw"
         action_needed = False
-        
+
         logger.debug(f"Starting BGP advertisement update: {action} {prefix} on router {router}")
         
         try:
