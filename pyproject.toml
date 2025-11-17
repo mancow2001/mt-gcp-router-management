@@ -3,8 +3,8 @@ requires = ["setuptools>=66", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mt-gcp-daemon"
-version = "0.1.0"
+name = "gcp-route-mgmt-daemon"
+version = "@@VERSION@@"
 description = "Multi-region GCP backend/BGP health daemon with Cloudflare Magic Transit route control"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,8 +19,8 @@ dependencies = [
 ]
 
 [project.scripts]
-mt-gcp-daemon = "mt_gcp_daemon.__main__:main"
+gcp-route-mgmt = "gcp_route_mgmt_daemon.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["mt_gcp_daemon"]
+packages = ["gcp_route_mgmt_daemon"]

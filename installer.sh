@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="mt-gcp-daemon"
+SERVICE_NAME="gcp-route-mgmt"
 INSTALL_DIR="/opt/${SERVICE_NAME}"
 VENV_DIR="${INSTALL_DIR}/venv"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -190,10 +190,10 @@ mkdir -p "${INSTALL_DIR}"
 rsync -a --delete --exclude 'venv' ./ "${INSTALL_DIR}/"
 
 # Discover the src directory
-echo "[*] Locating source directory (src/mt_gcp_daemon) ..."
-PKG_DIR="$(find "${INSTALL_DIR}" -type d -path '*/src/mt_gcp_daemon' -print -quit || true)"
+echo "[*] Locating source directory (src/gcp_route_mgmt_daemon) ..."
+PKG_DIR="$(find "${INSTALL_DIR}" -type d -path '*/src/gcp_route_mgmt_daemon' -print -quit || true)"
 if [[ -z "${PKG_DIR}" ]]; then
-  echo "[-] Could not find src/mt_gcp_daemon in ${INSTALL_DIR}."
+  echo "[-] Could not find src/gcp_route_mgmt_daemon in ${INSTALL_DIR}."
   exit 1
 fi
 SRC_ROOT="$(dirname "${PKG_DIR}")"
@@ -242,7 +242,7 @@ Type=simple
 WorkingDirectory=${INSTALL_DIR}
 Environment=PYTHONPATH=${SRC_ROOT}:\$PYTHONPATH
 EnvironmentFile=${ENV_FILE}
-ExecStart=${VENV_DIR}/bin/python -u -m mt_gcp_daemon
+ExecStart=${VENV_DIR}/bin/python -u -m gcp_route_mgmt_daemon
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
