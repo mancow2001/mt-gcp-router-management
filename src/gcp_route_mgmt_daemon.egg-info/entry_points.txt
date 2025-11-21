@@ -1,0 +1,2 @@
+[console_scripts]
+gcp-route-mgmt = gcp_route_mgmt_daemon.__main__:main
