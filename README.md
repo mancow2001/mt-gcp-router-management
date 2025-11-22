@@ -406,6 +406,115 @@ API token requires:
 - **Account:Read** - For token verification
 - **Zone:Zone Settings:Edit** - For Magic Transit route management
 
+### Authentication Methods
+
+The daemon supports two authentication methods for GCP API access:
+
+#### Method 1: Workload Identity Federation (Recommended)
+
+**Best for:** Production deployments on GKE, GCE, Cloud Run, or Cloud Functions
+
+**Advantages:**
+- ✅ No long-lived service account keys to manage
+- ✅ Automatic credential rotation
+- ✅ Reduced attack surface
+- ✅ Better audit trails
+- ✅ Follows Google Cloud security best practices
+
+**Setup:**
+
+**For GKE (Google Kubernetes Engine):**
+```bash
+# 1. Create GCP service account (no key needed)
+gcloud iam service-accounts create gcp-route-mgmt-sa \
+    --display-name="GCP Route Management Service Account"
+
+# 2. Grant required IAM permissions
+gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/compute.viewer"
+
+gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/compute.networkAdmin"
+
+# 3. Create Kubernetes service account
+kubectl create serviceaccount gcp-route-mgmt-sa
+
+# 4. Bind Kubernetes SA to GCP SA
+gcloud iam service-accounts add-iam-policy-binding \
+    gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com \
+    --role roles/iam.workloadIdentityUser \
+    --member "serviceAccount:PROJECT_ID.svc.id.goog[NAMESPACE/gcp-route-mgmt-sa]"
+
+# 5. Annotate Kubernetes service account
+kubectl annotate serviceaccount gcp-route-mgmt-sa \
+    iam.gke.io/gcp-service-account=gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com
+
+# 6. Configure .env file
+echo "USE_WORKLOAD_IDENTITY=true" >> .env
+# Note: GOOGLE_APPLICATION_CREDENTIALS is not needed
+```
+
+**For GCE (Compute Engine VM):**
+```bash
+# 1. Create VM with attached service account
+gcloud compute instances create gcp-route-mgmt-vm \
+    --service-account=gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com \
+    --scopes=cloud-platform
+
+# 2. Configure .env file on VM
+echo "USE_WORKLOAD_IDENTITY=true" >> .env
+```
+
+**For Local Development (Application Default Credentials):**
+```bash
+# Set up ADC using gcloud
+gcloud auth application-default login
+
+# Configure .env file
+echo "USE_WORKLOAD_IDENTITY=true" >> .env
+```
+
+#### Method 2: Service Account Key File (Legacy)
+
+**Best for:** Local development, testing, or environments where Workload Identity is not available
+
+**Setup:**
+
+```bash
+# 1. Create service account
+gcloud iam service-accounts create gcp-route-mgmt-sa \
+    --display-name="GCP Route Management Service Account"
+
+# 2. Grant required permissions (same as above)
+gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/compute.viewer"
+
+gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com" \
+    --role="roles/compute.networkAdmin"
+
+# 3. Create and download key file
+gcloud iam service-accounts keys create key.json \
+    --iam-account=gcp-route-mgmt-sa@PROJECT_ID.iam.gserviceaccount.com
+
+# 4. Secure the key file
+chmod 600 key.json
+
+# 5. Configure .env file
+echo "USE_WORKLOAD_IDENTITY=false" >> .env
+echo "GOOGLE_APPLICATION_CREDENTIALS=key.json" >> .env
+```
+
+**Security Notes for Key Files:**
+- Store key files securely with permissions 600 (owner read/write only)
+- Never commit key files to version control
+- Rotate keys regularly (every 90 days recommended)
+- Delete unused keys immediately
+- Consider using key rotation automation
+
 ### Installation Steps
 
 1. **Clone the repository:**

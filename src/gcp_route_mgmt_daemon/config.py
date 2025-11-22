@@ -88,6 +88,12 @@ class Config:
     # GCP and routing regions
     gcp_project: str | None = os.getenv('GCP_PROJECT')
     gcp_credentials: str | None = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+
+    # GCP Authentication Mode
+    # When true, uses Workload Identity Federation / Application Default Credentials
+    # When false (default), uses service account key file (GOOGLE_APPLICATION_CREDENTIALS)
+    use_workload_identity: bool = os.getenv('USE_WORKLOAD_IDENTITY', 'false').lower() == 'true'
+
     local_region: str | None = os.getenv('LOCAL_GCP_REGION')
     remote_region: str | None = os.getenv('REMOTE_GCP_REGION')
     local_bgp_router: str | None = os.getenv('LOCAL_BGP_ROUTER')
@@ -153,8 +159,9 @@ class Config:
 
 
 # List of required environment variables (presence-only validation)
-REQUIRED_VARS = [
-    'GCP_PROJECT', 'GOOGLE_APPLICATION_CREDENTIALS', 'LOCAL_GCP_REGION', 'REMOTE_GCP_REGION',
+# GOOGLE_APPLICATION_CREDENTIALS is conditionally required (checked in validate_configuration)
+REQUIRED_VARS_BASE = [
+    'GCP_PROJECT', 'LOCAL_GCP_REGION', 'REMOTE_GCP_REGION',
     'LOCAL_BGP_ROUTER', 'REMOTE_BGP_ROUTER', 'LOCAL_BGP_REGION', 'REMOTE_BGP_REGION',
     'BGP_PEER_PROJECT', 'PRIMARY_PREFIX', 'SECONDARY_PREFIX',
     'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_API_TOKEN', 'DESCRIPTION_SUBSTRING'
@@ -167,9 +174,10 @@ def validate_configuration(cfg: Config) -> list[str]:
 
     This includes:
     - Checking presence of required variables.
+    - Validating authentication configuration (Workload Identity OR service account key).
     - Validating CIDR/IP formatting.
     - Validating numeric ranges.
-    - Verifying GCP credentials file existence and readability.
+    - Verifying GCP credentials file existence and readability (when using service account).
 
     Args:
         cfg (Config): Parsed and populated configuration object.
@@ -179,10 +187,22 @@ def validate_configuration(cfg: Config) -> list[str]:
     """
     errors: list[str] = []
 
-    # Presence check
-    for var in REQUIRED_VARS:
+    # Presence check for base required variables
+    for var in REQUIRED_VARS_BASE:
         if not os.getenv(var):
             errors.append(f"Missing required environment variable: {var}")
+
+    # Authentication-specific validation
+    # Require either Workload Identity OR service account credentials
+    use_workload_identity = cfg.use_workload_identity
+    has_credentials_file = cfg.gcp_credentials is not None and cfg.gcp_credentials != ''
+
+    if not use_workload_identity and not has_credentials_file:
+        errors.append(
+            "GCP authentication not configured: Either set USE_WORKLOAD_IDENTITY=true "
+            "to use Workload Identity/Application Default Credentials, or set "
+            "GOOGLE_APPLICATION_CREDENTIALS to the path of a service account key file."
+        )
 
     # Validate IP prefix formats (CIDR blocks)
     for name in ['PRIMARY_PREFIX', 'SECONDARY_PREFIX']:
@@ -246,12 +266,13 @@ def validate_configuration(cfg: Config) -> list[str]:
         errors.append(f"HEALTH_CHECK_THRESHOLD ({cfg.health_check_threshold}) must be less than "
                      f"HEALTH_CHECK_WINDOW ({cfg.health_check_window})")
 
-    # GCP credential file existence & readability
-    creds = cfg.gcp_credentials
-    if creds and not os.path.isfile(creds):
-        errors.append(f"GCP credentials file not found: {creds}")
-    elif creds and not os.access(creds, os.R_OK):
-        errors.append(f"GCP credentials file not readable: {creds}")
+    # GCP credential file existence & readability (only when using service account key mode)
+    if not cfg.use_workload_identity:
+        creds = cfg.gcp_credentials
+        if creds and not os.path.isfile(creds):
+            errors.append(f"GCP credentials file not found: {creds}")
+        elif creds and not os.access(creds, os.R_OK):
+            errors.append(f"GCP credentials file not readable: {creds}")
 
     # Validate structured log file path if enabled
     if cfg.enable_structured_file and cfg.structured_log_file:

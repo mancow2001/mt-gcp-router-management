@@ -112,6 +112,8 @@ import os
 import logging
 import time
 from typing import Optional, Dict, List, Any, Tuple, Callable
+import google.auth
+from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -137,125 +139,244 @@ PERMANENT_HTTP_ERRORS = [403, 404]        # Errors that indicate configuration i
 TRANSIENT_HTTP_ERRORS = [429, 500, 502, 503, 504]  # Errors that may be retried
 
 
-def build_compute_client(creds_path: str, timeout: int = DEFAULT_API_TIMEOUT):
+def build_compute_client(creds_path: Optional[str] = None,
+                         timeout: int = DEFAULT_API_TIMEOUT,
+                         use_workload_identity: Optional[bool] = None):
     """
-    Initialize a Google Compute Engine API client using service account credentials.
+    Initialize a Google Compute Engine API client with support for both authentication methods.
 
-    This function creates an authenticated client for the Compute Engine API using
-    service account credentials from a JSON key file. The client is configured with
-    appropriate defaults for production use.
+    This function creates an authenticated client for the Compute Engine API using either:
+    1. Workload Identity Federation / Application Default Credentials (recommended)
+    2. Service account JSON key file (legacy, but still supported)
+
+    The authentication method is automatically detected or can be explicitly specified.
+    Workload Identity is used when running on GKE, GCE, or with external identity providers,
+    eliminating the need for long-lived service account keys.
 
     The returned client can be used for all Compute Engine operations including:
     - Backend service health monitoring
     - Cloud Router BGP management
     - Regional resource queries
 
-    Authentication:
-        Uses OAuth 2.0 service account authentication with JSON key file.
-        The service account must have appropriate IAM permissions for the
-        intended operations.
+    Authentication Methods:
+        1. **Workload Identity / Application Default Credentials (ADC)**:
+           - Automatically detected when running on GKE or GCE
+           - Uses google.auth.default() to discover credentials
+           - Supports external workload identity providers
+           - No key files needed - more secure
+           - Credentials automatically rotated
+
+        2. **Service Account Key File (Legacy)**:
+           - Uses OAuth 2.0 service account authentication with JSON key file
+           - Requires manual key rotation
+           - Key file must be stored securely
+           - Still supported for backward compatibility
 
     Args:
-        creds_path (str): Absolute or relative path to the service account JSON key file.
-            The file must be readable by the current process and contain valid
-            service account credentials.
+        creds_path (str, optional): Path to service account JSON key file (for legacy auth).
+            If None and use_workload_identity is False/None, will attempt ADC.
+            Defaults to None.
         timeout (int, optional): [Deprecated/Unused] HTTP request timeout parameter.
             Kept for backward compatibility but no longer used in Python 3.12+.
-            The modern google-api-python-client handles timeouts internally.
             Defaults to DEFAULT_API_TIMEOUT.
+        use_workload_identity (bool, optional): Force specific authentication method.
+            - True: Force Workload Identity / ADC
+            - False: Force service account key file (requires creds_path)
+            - None: Auto-detect (use Workload Identity if creds_path is None)
+            Defaults to None (auto-detect).
 
     Returns:
         googleapiclient.discovery.Resource: Authenticated Compute Engine API client
             configured for version v1. The client includes built-in retry logic
             and connection pooling for optimal performance.
-            
+
     Raises:
-        FileNotFoundError: If the credentials file does not exist or is not readable.
-            This is a permanent error that indicates a configuration issue.
-        google.auth.exceptions.GoogleAuthError: If the credentials file is invalid,
+        FileNotFoundError: If using service account key mode and credentials file
+            does not exist or is not readable.
+        google.auth.exceptions.GoogleAuthError: If credentials are invalid,
             corrupted, or the service account has been disabled.
-        google.auth.exceptions.RefreshError: If the credentials cannot be refreshed,
+        google.auth.exceptions.RefreshError: If credentials cannot be refreshed,
             typically due to network issues or revoked access.
-        ValueError: If the credentials file is not valid JSON or missing required fields.
-        
+        google.auth.exceptions.DefaultCredentialsError: If using Workload Identity
+            and no credentials can be discovered (ADC not configured).
+        ValueError: If configuration is invalid (e.g., no creds_path in key file mode).
+
     Security Considerations:
-        - Service account key files contain sensitive credentials
+        **Workload Identity (Recommended)**:
+        - No long-lived keys to manage or rotate
+        - Automatic credential rotation
+        - Reduced attack surface
+        - Better audit trails
+        - Follows Google Cloud best practices
+
+        **Service Account Keys (Legacy)**:
         - Store key files securely with appropriate file permissions (600)
         - Never commit key files to version control
-        - Consider using Workload Identity or other keyless authentication in production
-        - Rotate service account keys regularly per security best practices
-        
+        - Rotate keys regularly per security best practices
+        - Consider migrating to Workload Identity
+
     Performance:
         - Client initialization: ~200-500ms depending on network latency
         - Client includes connection pooling for subsequent API calls
         - Discovery document is cached to improve startup time
         - Recommended to create client once and reuse throughout application lifecycle
+        - Workload Identity may add ~100ms for first credential fetch
 
     Python 3.12+ Compatibility:
         - Uses modern credentials-based authentication (credentials parameter)
         - Compatible with google-auth 2.x and google-api-python-client 2.x
         - No longer uses deprecated httplib2.Http().authorize() method
-        
-    Example:
-        # Basic usage
+        - Full support for Workload Identity Federation
+
+    Examples:
+        # Workload Identity (auto-detected on GKE/GCE)
+        compute = build_compute_client(use_workload_identity=True)
+
+        # Workload Identity (explicit)
+        compute = build_compute_client()  # No creds_path = auto-detects Workload Identity
+
+        # Service account key file (legacy)
         compute = build_compute_client('/path/to/service-account.json')
-        
+
         # With error handling
         try:
-            compute = build_compute_client(os.getenv('GCP_CREDENTIALS_PATH'))
-            print("GCP client initialized successfully")
-        except FileNotFoundError:
-            print("Credentials file not found - check path configuration")
+            compute = build_compute_client(use_workload_identity=True)
+            print("GCP client initialized with Workload Identity")
+        except google.auth.exceptions.DefaultCredentialsError:
+            print("Workload Identity not configured - check environment")
         except Exception as e:
             print(f"Failed to initialize GCP client: {e}")
-            
+
     IAM Permissions Required:
-        The service account should have these roles or equivalent permissions:
+        The service account (or workload identity principal) should have these
+        roles or equivalent permissions:
         - roles/compute.viewer: For reading backend services and router status
         - roles/compute.networkAdmin: For modifying BGP advertisements
-        
+
         Or custom role with specific permissions:
         - compute.backendServices.get
-        - compute.backendServices.getHealth  
+        - compute.backendServices.getHealth
         - compute.routers.get
         - compute.routers.getRouterStatus
         - compute.routers.update
         - compute.regions.get
         - compute.projects.get
+
+    Deployment Environments:
+        **GKE (Google Kubernetes Engine)**:
+        - Configure Kubernetes service account with Workload Identity binding
+        - Set use_workload_identity=True or omit creds_path
+        - No configuration files needed
+
+        **GCE (Compute Engine VM)**:
+        - Attach service account to VM instance
+        - Set use_workload_identity=True or omit creds_path
+        - Uses instance metadata service for credentials
+
+        **External (On-premises, other clouds)**:
+        - Configure Workload Identity Federation with external IdP
+        - Provide credentials via environment or config file
+        - See GCP Workload Identity Federation documentation
+
+        **Local Development**:
+        - Use service account key file for testing
+        - Set GOOGLE_APPLICATION_CREDENTIALS environment variable
+        - Or use gcloud auth application-default login
     """
-    # Validate credentials file exists and is readable
-    if not os.path.exists(creds_path):
-        error_msg = f"GCP credentials file not found: {creds_path}"
-        logger.error(error_msg)
-        raise FileNotFoundError(error_msg)
-    
-    if not os.access(creds_path, os.R_OK):
-        error_msg = f"GCP credentials file not readable: {creds_path}"
-        logger.error(error_msg)
-        raise PermissionError(error_msg)
-    
     try:
-        logger.debug(f"Loading GCP service account credentials from: {creds_path}")
+        # Determine authentication method
+        # Priority: explicit use_workload_identity > presence of creds_path
+        if use_workload_identity is True or (use_workload_identity is None and creds_path is None):
+            # Use Workload Identity Federation / Application Default Credentials
+            logger.debug("Using Workload Identity Federation or Application Default Credentials")
+            logger.info("Initializing GCP client with Workload Identity / Application Default Credentials")
 
-        # Load service account credentials from JSON key file
-        creds = service_account.Credentials.from_service_account_file(creds_path)
+            try:
+                # Attempt to discover and load credentials automatically
+                # This works in GKE, GCE, Cloud Run, Cloud Functions, and with ADC setup
+                creds, project = google.auth.default(scopes=[
+                    'https://www.googleapis.com/auth/compute'
+                ])
 
-        # Build Compute Engine API client with credentials
+                # Refresh credentials to ensure they're valid and to detect issues early
+                logger.debug("Refreshing Workload Identity credentials")
+                creds.refresh(Request())
+
+                logger.info("Workload Identity credentials initialized and refreshed successfully")
+                if project:
+                    logger.debug(f"Detected GCP project from credentials: {project}")
+
+            except google.auth.exceptions.DefaultCredentialsError as e:
+                error_msg = (
+                    f"Workload Identity / Application Default Credentials not found: {e}\n"
+                    f"Possible solutions:\n"
+                    f"  - Running on GKE: Ensure Workload Identity is enabled and service account is bound\n"
+                    f"  - Running on GCE: Ensure VM has service account attached\n"
+                    f"  - Local development: Run 'gcloud auth application-default login'\n"
+                    f"  - Or set GOOGLE_APPLICATION_CREDENTIALS environment variable\n"
+                    f"  - Or use service account key file by providing creds_path parameter"
+                )
+                logger.error(error_msg)
+                raise google.auth.exceptions.DefaultCredentialsError(error_msg)
+
+        else:
+            # Legacy: Use service account key file
+            if not creds_path:
+                error_msg = (
+                    "Service account key file path (creds_path) is required when not using Workload Identity. "
+                    "Either provide creds_path or set use_workload_identity=True to use Application Default Credentials."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            logger.debug(f"Using service account key file authentication: {creds_path}")
+            logger.info(f"Initializing GCP client with service account key file: {creds_path}")
+
+            # Validate credentials file exists and is readable
+            if not os.path.exists(creds_path):
+                error_msg = f"GCP credentials file not found: {creds_path}"
+                logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
+
+            if not os.access(creds_path, os.R_OK):
+                error_msg = f"GCP credentials file not readable: {creds_path} (check file permissions)"
+                logger.error(error_msg)
+                raise PermissionError(error_msg)
+
+            # Load service account credentials from JSON key file
+            logger.debug(f"Loading service account credentials from file")
+            creds = service_account.Credentials.from_service_account_file(
+                creds_path,
+                scopes=['https://www.googleapis.com/auth/compute']
+            )
+            logger.debug("Service account credentials loaded successfully")
+
+        # Build Compute Engine API client (same for both auth methods)
         # Python 3.12+ compatible: pass credentials directly instead of using authorize()
         # cache_discovery=False prevents caching discovery documents to disk
+        logger.debug("Building Compute Engine API client")
         compute = build(
             serviceName='compute',
             version=GCP_API_VERSION,
             credentials=creds,
             cache_discovery=False
         )
-        
-        logger.debug("GCP Compute Engine client initialized successfully")
+
+        logger.info("GCP Compute Engine client initialized successfully")
+        logger.debug(f"Client configured for Compute Engine API version {GCP_API_VERSION}")
         return compute
-        
+
+    except google.auth.exceptions.DefaultCredentialsError:
+        # Re-raise ADC errors with helpful context (already logged above)
+        raise
+
+    except (FileNotFoundError, PermissionError):
+        # Re-raise file-related errors (already logged above)
+        raise
+
     except Exception as e:
         error_msg = f"Failed to build GCP compute client: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg, exc_info=True)
         raise
 
 

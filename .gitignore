@@ -1,1 +1,7 @@
 key.json
+/src/gcp_route_mgmt_daemon/__pycache__
+/src/gcp_route_mgmt_daemon/__pycache__
+/src/gcp_route_mgmt_daemon/__pycache__
+src/gcp_route_mgmt_daemon/__pycache__/config.cpython-314.pyc
+src/gcp_route_mgmt_daemon/__pycache__/gcp.cpython-314.pyc
+CLAUDE.md

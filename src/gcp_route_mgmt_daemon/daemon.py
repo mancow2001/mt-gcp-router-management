@@ -1139,9 +1139,24 @@ def startup(cfg: Config):
     
     try:
         # Build authenticated GCP Compute Engine client
-        logger.debug(f"Building GCP client with credentials: {cfg.gcp_credentials}")
-        compute = gcp_mod.build_compute_client(cfg.gcp_credentials, timeout=cfg.gcp_api_timeout)
-        
+        # Support both Workload Identity and service account key file authentication
+        if cfg.use_workload_identity:
+            logger.info("Using Workload Identity Federation / Application Default Credentials for GCP authentication")
+            logger.debug("Building GCP client with Workload Identity")
+            compute = gcp_mod.build_compute_client(
+                use_workload_identity=True,
+                timeout=cfg.gcp_api_timeout
+            )
+            auth_method = "Workload Identity / Application Default Credentials"
+        else:
+            logger.info(f"Using service account key file for GCP authentication: {cfg.gcp_credentials}")
+            logger.debug(f"Building GCP client with service account credentials: {cfg.gcp_credentials}")
+            compute = gcp_mod.build_compute_client(
+                creds_path=cfg.gcp_credentials,
+                timeout=cfg.gcp_api_timeout
+            )
+            auth_method = f"Service Account Key ({cfg.gcp_credentials})"
+
         # Test connectivity and permissions
         logger.debug(f"Testing GCP connectivity for project: {cfg.gcp_project}")
         gcp_mod.validate_gcp_connectivity(
@@ -1149,12 +1164,14 @@ def startup(cfg: Config):
             regions=[cfg.local_region, cfg.remote_region],
             compute=compute
         )
-        
+
         # Log successful GCP connectivity
         gcp_details = {
             "project": cfg.gcp_project,
             "regions": [cfg.local_region, cfg.remote_region],
-            "service_account": cfg.gcp_credentials,
+            "authentication_method": auth_method,
+            "use_workload_identity": cfg.use_workload_identity,
+            "service_account_file": cfg.gcp_credentials if not cfg.use_workload_identity else None,
             "local_bgp_router": cfg.local_bgp_router,
             "remote_bgp_router": cfg.remote_bgp_router,
             "local_router_only_mode": True  # Flag indicating only local router will be managed
